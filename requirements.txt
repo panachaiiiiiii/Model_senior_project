@@ -5,3 +5,7 @@ pillow
 numpy
 python-multipart
 firebase-admin
+opencv-python-headless
+keras
+xgboost
+dill

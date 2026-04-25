@@ -2,26 +2,40 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import keras
 import numpy as np
+from segment import segment_image
 from PIL import Image
+from io import BytesIO
+import tensorflow as tf
+import pickle
 
 # =========================
-# CLASS NAMES (แต่ละ model แยกได้)
+# CONFIG
 # =========================
 MODEL_CONFIG = {
     "Densenet121": {
-        "path": "DenseNet121_Model.keras",
-        "class_names": ["Nevus", "Cancer", "Benign", "Precancer"],
+        "path": "./model/DenseNet121.keras",
+        "class_names": ["โรคผิวหนังระยะก่อนเป็นมะเร็ง", "กลุ่มโรคมะเร็งผิวหนัง", "เนื้องอกผิวหนังชนิดไม่ร้ายแรง"],
         "img_size": (224, 224)
     },
     "MobileNetV2": {
-        "path": "MobileNetV2_Model.keras",
-        "class_names": ["Nevus", "Cancer", "Benign", "Precancer"],
+        "path": "./model/MobileNetV2.keras",
+        "class_names": ["โรคผิวหนังระยะก่อนเป็นมะเร็ง", "กลุ่มโรคมะเร็งผิวหนัง", "เนื้องอกผิวหนังชนิดไม่ร้ายแรง"],
         "img_size": (224, 224)
-    }
+    },
+    "ResNet50": {
+        "path": "./model/ResNet50.keras",
+        "class_names": ["โรคผิวหนังระยะก่อนเป็นมะเร็ง", "กลุ่มโรคมะเร็งผิวหนัง", "เนื้องอกผิวหนังชนิดไม่ร้ายแรง"],
+        "img_size": (224, 224)
+    },
+    "Densenet121_segmented": {
+        "path": "./model/Segmented_DenseNet121.keras",
+        "class_names": ["โรคผิวหนังระยะก่อนเป็นมะเร็ง", "กลุ่มโรคมะเร็งผิวหนัง", "เนื้องอกผิวหนังชนิดไม่ร้ายแรง"],
+        "img_size": (224, 224)
+    },
 }
 
 # =========================
-# PATCH Dense (fix quantization_config)
+# PATCH Dense
 # =========================
 from keras.layers import Dense
 
@@ -33,7 +47,7 @@ def _patched_init(self, *args, **kwargs):
 Dense.__init__ = _patched_init
 
 # =========================
-# Dummy loss
+# LOSS
 # =========================
 def loss_fn(y_true, y_pred):
     return keras.losses.categorical_crossentropy(y_true, y_pred)
@@ -52,10 +66,27 @@ app.add_middleware(
 )
 
 # =========================
-# 🔥 LOAD ALL MODELS
+# LOAD MODELS
 # =========================
 models = {}
 
+# โหลด hybrid keras (ไม่ compile)
+hybrid_base = tf.keras.models.load_model(
+    "./model/hybrid/Hybrid_DenseNet121.keras",
+    compile=False
+)
+
+# feature extractor (512 dim)
+feature_extractor = tf.keras.Model(
+    inputs=hybrid_base.input,
+    outputs=hybrid_base.get_layer("dense").output
+)
+
+# โหลด pkl
+with open("./model/hybrid/Hybrid_PAD_DenseNet121_xgb.pkl", "rb") as f:
+    pkl_model = pickle.load(f)
+
+# โหลด model ปกติ
 for name, config in MODEL_CONFIG.items():
     models[name] = keras.models.load_model(
         config["path"],
@@ -69,11 +100,62 @@ print(f"Loaded models: {list(models.keys())}")
 # =========================
 # PREPROCESS
 # =========================
-def preprocess(image: Image.Image, size) -> np.ndarray:
+def preprocess(image: Image.Image, size):
     image = image.resize(size)
     image = image.convert("RGB")
-    img_array = np.array(image, dtype=np.float32) / 255.0
-    return np.expand_dims(img_array, axis=0)
+    arr = np.array(image, dtype=np.float32) / 255.0
+    return np.expand_dims(arr, axis=0)
+
+# =========================
+# ENSEMBLE
+# =========================
+def predict_ensemble_from_image(img: Image.Image):
+    selected_models = ["Densenet121", "MobileNetV2", "ResNet50"]
+
+    probs_list = []
+
+    for m in selected_models:
+        model = models[m]
+        config = MODEL_CONFIG[m]
+
+        x = preprocess(img, config["img_size"])
+        pred = model.predict(x, verbose=0)[0]
+        probs_list.append(pred)
+
+    ensemble_probs = np.mean(probs_list, axis=0)
+
+    class_names = MODEL_CONFIG["Densenet121"]["class_names"]
+
+    return {
+        "model": "ensemble_model",
+        "models_used": selected_models,
+        "result": {
+            class_names[i]: round(float(prob) * 100, 2)
+            for i, prob in enumerate(ensemble_probs)
+        }
+    }
+
+# =========================
+# HYBRID
+# =========================
+def predict_hybrid(img: Image.Image):
+    x = preprocess(img, (224, 224))
+
+    # feature 512
+    features = feature_extractor.predict(x, verbose=0)
+
+    # pkl
+    probs = pkl_model.predict_proba(features)[0]
+
+    class_names = MODEL_CONFIG["Densenet121"]["class_names"]
+
+    return {
+        "model": "hybrid",
+        "result": {
+            class_names[i]: round(float(prob) * 100, 2)
+            for i, prob in enumerate(probs)
+        }
+    }
 
 # =========================
 # API
@@ -83,7 +165,15 @@ async def predict(
     file: UploadFile = File(...),
     model_name: str = Form(...)
 ):
-    # 🔹 check model exists
+    contents = await file.read()
+    img = Image.open(BytesIO(contents)).convert("RGB")
+
+    if model_name == "ensemble_model":
+        return predict_ensemble_from_image(img)
+
+    if model_name == "hybrid":
+        return predict_hybrid(img)
+
     if model_name not in models:
         raise HTTPException(
             status_code=400,
@@ -93,11 +183,12 @@ async def predict(
     model = models[model_name]
     config = MODEL_CONFIG[model_name]
 
-    # 🔹 preprocess
-    img = Image.open(file.file).convert("RGB")
-    x = preprocess(img, config["img_size"])
+    if model_name == "Densenet121_segmented":
+        img_array = segment_image(img, img_size=config["img_size"])
+        x = np.expand_dims(img_array.astype(np.float32) / 255.0, axis=0)
+    else:
+        x = preprocess(img, config["img_size"])
 
-    # 🔹 predict
     prediction = model.predict(x, verbose=0)
 
     return {
@@ -107,17 +198,27 @@ async def predict(
             for i, prob in enumerate(prediction[0])
         }
     }
-    
-    
+
+# =========================
+# MODELS LIST
+# =========================
 @app.get("/models")
 def get_models():
-    return {
-        "models": [
-            {
-                "name": name,
-                "class_names": config["class_names"],
-                "img_size": config["img_size"]
-            }
-            for name, config in MODEL_CONFIG.items()
-        ]
-    }
+    model_list = [
+        {
+            "name": name,
+            "class_names": config["class_names"],
+            "img_size": config["img_size"]
+        }
+        for name, config in MODEL_CONFIG.items()
+    ]
+
+    model_list.append({
+        "name": "ensemble_model",
+        "img_size": (224, 224)
+    },{
+        "name": "hybrid",
+        "img_size": (224, 224)
+    })
+
+    return {"models": model_list}
