@@ -7,6 +7,26 @@ from PIL import Image
 from io import BytesIO
 import tensorflow as tf
 import pickle
+import os
+import gdown
+
+# =========================
+# DOWNLOAD FOLDER (ครั้งเดียว)
+# =========================
+FOLDER_URL = "https://drive.google.com/drive/folders/1mNHHtEHOrYBiZ77POK-N4UjgotMvHTmb"
+
+def download_models():
+    if not os.path.exists("./model"):
+        print("Downloading models from Google Drive...")
+        gdown.download_folder(
+            url=FOLDER_URL,
+            output="./model",
+            quiet=False
+        )
+    else:
+        print("Models already exist, skip download.")
+
+download_models()
 
 # =========================
 # CONFIG
@@ -70,23 +90,22 @@ app.add_middleware(
 # =========================
 models = {}
 
-# โหลด hybrid keras (ไม่ compile)
+# hybrid keras
 hybrid_base = tf.keras.models.load_model(
     "./model/hybrid/Hybrid_DenseNet121.keras",
     compile=False
 )
 
-# feature extractor (512 dim)
 feature_extractor = tf.keras.Model(
     inputs=hybrid_base.input,
     outputs=hybrid_base.get_layer("dense").output
 )
 
-# โหลด pkl
+# pkl
 with open("./model/hybrid/Hybrid_PAD_DenseNet121_xgb.pkl", "rb") as f:
     pkl_model = pickle.load(f)
 
-# โหลด model ปกติ
+# normal models
 for name, config in MODEL_CONFIG.items():
     models[name] = keras.models.load_model(
         config["path"],
@@ -113,17 +132,12 @@ def predict_ensemble_from_image(img: Image.Image):
     selected_models = ["Densenet121", "MobileNetV2", "ResNet50"]
 
     probs_list = []
-
     for m in selected_models:
-        model = models[m]
-        config = MODEL_CONFIG[m]
-
-        x = preprocess(img, config["img_size"])
-        pred = model.predict(x, verbose=0)[0]
+        x = preprocess(img, MODEL_CONFIG[m]["img_size"])
+        pred = models[m].predict(x, verbose=0)[0]
         probs_list.append(pred)
 
     ensemble_probs = np.mean(probs_list, axis=0)
-
     class_names = MODEL_CONFIG["Densenet121"]["class_names"]
 
     return {
@@ -140,11 +154,7 @@ def predict_ensemble_from_image(img: Image.Image):
 # =========================
 def predict_hybrid(img: Image.Image):
     x = preprocess(img, (224, 224))
-
-    # feature 512
     features = feature_extractor.predict(x, verbose=0)
-
-    # pkl
     probs = pkl_model.predict_proba(features)[0]
 
     class_names = MODEL_CONFIG["Densenet121"]["class_names"]
@@ -161,10 +171,7 @@ def predict_hybrid(img: Image.Image):
 # API
 # =========================
 @app.post("/predict")
-async def predict(
-    file: UploadFile = File(...),
-    model_name: str = Form(...)
-):
+async def predict(file: UploadFile = File(...), model_name: str = Form(...)):
     contents = await file.read()
     img = Image.open(BytesIO(contents)).convert("RGB")
 
@@ -175,12 +182,8 @@ async def predict(
         return predict_hybrid(img)
 
     if model_name not in models:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Model '{model_name}' not found"
-        )
+        raise HTTPException(status_code=400, detail=f"Model '{model_name}' not found")
 
-    model = models[model_name]
     config = MODEL_CONFIG[model_name]
 
     if model_name == "Densenet121_segmented":
@@ -189,7 +192,7 @@ async def predict(
     else:
         x = preprocess(img, config["img_size"])
 
-    prediction = model.predict(x, verbose=0)
+    prediction = models[model_name].predict(x, verbose=0)
 
     return {
         "model": model_name,
@@ -213,12 +216,7 @@ def get_models():
         for name, config in MODEL_CONFIG.items()
     ]
 
-    model_list.append({
-        "name": "ensemble_model",
-        "img_size": (224, 224)
-    },{
-        "name": "hybrid",
-        "img_size": (224, 224)
-    })
+    model_list.append({"name": "ensemble_model", "img_size": (224, 224)})
+    model_list.append({"name": "hybrid", "img_size": (224, 224)})
 
     return {"models": model_list}
